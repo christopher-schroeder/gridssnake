@@ -1,3 +1,3 @@
 # gridssnake
 
-this is a [snakemake](https://snakemake.readthedocs.io/en/stable/) implementation of
+This is a [snakemake](https://snakemake.readthedocs.io/en/stable/) implementation of the [gridss](https://github.com/PapenfussLab/GRIDSS) pipeline.
