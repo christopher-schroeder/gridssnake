@@ -1,0 +1,109 @@
+from snakemake.utils import min_version
+
+min_version("5.7.0")
+
+import pandas as pd
+from snakemake.remote import FTP
+from snakemake.utils import validate
+
+ftp = FTP.RemoteProvider()
+
+samples = pd.read_csv(config["samples"], sep="\t", dtype={"sample_name": str, "group": str}).set_index("sample_name", drop=False).sort_index()
+
+def _group_or_sample(row):
+    group = row.get("group", None)
+    if pd.isnull(group):
+        return row["sample_name"]
+    return group
+
+samples["group"] = [_group_or_sample(row) for _, row in samples.iterrows()]
+#validate(samples, schema="../schemas/samples.schema.yaml")
+
+units = pd.read_csv(config["units"], sep="\t", dtype={"sample_name": str, "unit_name": str}).set_index(["sample_name", "unit_name"], drop=False).sort_index()
+#validate(units, schema="../schemas/units.schema.yaml")
+
+def is_paired_end(sample):
+    sample_units = units.loc[sample]
+    fq2_null = sample_units["fq2"].isnull()
+    sra_null = sample_units["sra"].isnull()
+    paired = ~fq2_null | ~sra_null
+    all_paired = paired.all()
+    all_single = (~paired).all()
+    assert all_single or all_paired, "invalid units for sample {}, must be all paired end or all single end".format(sample)
+    return all_paired
+
+def get_merged(wildcards):
+    if is_paired_end(wildcards.sample):
+        return ["results/merged/{sample}.1.fastq.gz",
+                "results/merged/{sample}.2.fastq.gz"]
+    return "results/merged/{sample}.single.fastq.gz"
+
+def get_group_aliases(wildcards):
+    return samples.loc[samples["group"] == wildcards.group]["alias"]
+
+
+def get_group_samples(wildcards):
+    return samples.loc[samples["group"] == wildcards.group]["sample_name"]
+
+
+def get_group_bams(wildcards):
+    return expand("results/recal/{sample}.sorted.bam", sample=get_group_samples(wildcards))
+
+def get_group_observations(wildcards):
+    return expand("results/observations/{group}/{sample}.{caller}.bcf", 
+                  caller=wildcards.caller, 
+                  group=wildcards.group,
+                  sample=get_group_samples(wildcards))
+
+def get_group_bais(wildcards):
+    return expand("results/recal/{sample}.sorted.bam.bai", sample=get_group_samples(wildcards))
+
+#def is_activated(xpath):
+#    c = config
+#    for entry in xpath.split("/"):
+#        if entry == "results":
+#            continue
+#        c = c.get(entry, {})
+#    return bool(c["activate"])
+
+
+def get_read_group(wildcards):
+    """Denote sample name and platform in read group."""
+    return r"-R '@RG\tID:{sample}\tSM:{sample}\tPL:{platform}'".format(
+        sample=wildcards.sample,
+        platform=samples.loc[wildcards.sample, "platform"])
+
+
+#def get_tmb_targets():
+#    if is_activated("tmb"):
+#        return expand("results/plots/tmb/{group}.tmb.svg",
+#                      group=groups)
+#    else:
+#        return []
+
+#def get_strling_targets():
+#    if is_activated("repeats/strling"):
+#        return expand("results/strling_call/{sample}-genotype.txt", sample=samples.sample_name.values)
+#    else:
+#        return []
+
+
+#def get_annotated_bcf(wildcards, group=None):
+#    if group is None:
+#        group = wildcards.group
+#    selection = ".annotated"
+#    if is_activated("annotations/vcfs"):
+#        selection += ".db-annotated"
+#    if is_activated("annotations/dbnsfp"):
+#        selection += ".dbnsfp"
+#    if is_activated("annotations/dgidb"):
+#        selection += ".dgidb"
+#    return "results/calls/{group}{selection}.bcf".format(group=group, selection=selection)
+
+
+#wildcard_constraints:
+#    group="|".join(samples["group"].unique()),
+#    sample="|".join(samples["sample_name"]),
+#    caller="|".join(["freebayes", "delly"])
+
+#caller=list(filter(None, ["freebayes" if is_activated("results/calling/freebayes") else None, "delly" if is_activated("calling/delly") else None]))

@@ -1,0 +1,420 @@
+configfile: "config/config.yaml"
+include: "rules/common.smk"
+
+reference = "../strling/ref_bwa/GCA_000001405.15_GRCh38_no_alt_plus_hs38d1_analysis_set.fna"
+
+jvm_args = f"-Dreference_fasta={reference} -Dsamjdk.use_async_io_read_samtools=true -Dsamjdk.use_async_io_write_samtools=true -Dsamjdk.use_async_io_write_tribble=true -Dsamjdk.buffer_size=4194304"
+
+groups = samples["group"].unique()
+
+rule all:
+    input:
+        #expand("results/gridss_merged_sv/{sample}.sv.bam", sample=["EPF-BUR-012-013"])
+        #"results/gridss_assembly/test.bam"
+        #"results/gridss_assembly_primary.sv/EPF-BUR.sc2sr.suppsorted.sv.bam"
+        #"results/gridss_assembly_merged_sv/EPF-BUR.sv.bam"
+        #"results/gridss_vcf_final/EPF-BUR.vcf"
+        #expand("tmp/gridss/{sample}.gridss.working/sample.{sample}.sc2sr.primary.sv.bam", sample=["EPF-BUR-012-013"])
+        expand("results/gridss_vcf/{group}.vcf", group=groups)
+
+
+rule CollectGridssMetrics:
+    input:
+        #bam="{sample.bam}"
+        bam="../varlociraptor/results/dedup/{sample}.bam"
+    output:
+        insert_size_metrics="results/gridss_metrics/{sample}.insert_size_metrics",
+        histogram="results/gridss_metrics/{sample}.insert_size_histogram.pdf"
+    params:
+        tmp_dir="tmp/gridss/{sample}.gridss.working",
+        prefix="results/gridss_metrics/{sample}",
+        maxcoverage=50000,
+        metricsrecords=10000000,
+        picardoptions=""
+    log:
+        "log/collect_gridss_metrics.{sample}.log"
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.analysis.CollectGridssMetrics \
+{jvm_args} \
+TMP_DIR={params.tmp_dir} \
+ASSUME_SORTED=true \
+I={input.bam} \
+O={params.prefix} \
+THRESHOLD_COVERAGE={params.maxcoverage} \
+FILE_EXTENSION=null \
+GRIDSS_PROGRAM=null \
+PROGRAM=null \
+PROGRAM=CollectInsertSizeMetrics \
+STOP_AFTER={params.metricsrecords} \
+{params.picardoptions} 2> {log}
+        """
+
+
+rule CollectGridssMetricsAndExtractSVReads:
+    threads:
+        50
+    input:
+        bam="../varlociraptor/results/dedup/{sample}.bam",
+        insert_size_metrics="results/gridss_metrics/{sample}.insert_size_metrics",
+    output:
+        sv_metrics="results/gridss_sv_metrics/{sample}.sv_metrics",
+        namedsorted_bam="tmp/gridss/{sample}.bam.gridss.working/{sample}.namedsorted.bam",
+    params:
+        dir="tmp/gridss/{sample}.bam.gridss.working",
+        prefix="results/gridss_sv_metrics/{sample}",
+        tmp_sort="tmp/gridss/{sample}.bam.gridss.working/{sample}.namedsort",
+        maxcoverage=50000,
+        picardoptions="",
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.CollectGridssMetricsAndExtractSVReads \
+{jvm_args} \
+TMP_DIR={params.dir} \
+ASSUME_SORTED=true \
+I={input.bam} \
+O={params.prefix} \
+THRESHOLD_COVERAGE={params.maxcoverage} \
+FILE_EXTENSION=null \
+GRIDSS_PROGRAM=null \
+GRIDSS_PROGRAM=CollectCigarMetrics \
+GRIDSS_PROGRAM=CollectMapqMetrics \
+GRIDSS_PROGRAM=CollectTagMetrics \
+GRIDSS_PROGRAM=CollectIdsvMetrics \
+GRIDSS_PROGRAM=ReportThresholdCoverage \
+PROGRAM=null \
+PROGRAM=CollectInsertSizeMetrics \
+SV_OUTPUT=/dev/stdout \
+COMPRESSION_LEVEL=0 \
+METRICS_OUTPUT={output.sv_metrics} \
+INSERT_SIZE_METRICS={input.insert_size_metrics} \
+UNMAPPED_READS=false \
+MIN_CLIP_LENGTH=5 \
+INCLUDE_DUPLICATES=true \
+{params.picardoptions} \
+| samtools sort \
+-n \
+-m 100G \
+-T {params.tmp_sort} \
+-Obam \
+-o {output.namedsorted_bam} \
+-@ {threads} \
+/dev/stdin
+        """
+
+
+rule ComputeSamTags:
+    threads:
+        3
+    input:
+        ref=reference,
+        namedsorted_bam="tmp/gridss/{sample}.bam.gridss.working/{sample}.namedsorted.bam",
+    output:
+        coordinate_bam="tmp/gridss/{sample}.bam.gridss.working/{sample}.coordinate.bam"
+    params:
+        working_dir="tmp/gridss",
+        tmp_sort="tmp/gridss/{sample}.bam.gridss.working/{sample}.coordinate-tmp",
+        dir="tmp/gridss/{sample}.bam.gridss.working",
+        picardoptions="",
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.ComputeSamTags \
+{jvm_args} \
+TMP_DIR={params.dir} \
+WORKING_DIR="{params.working_dir}" \
+REFERENCE_SEQUENCE={input.ref} \
+COMPRESSION_LEVEL=0 \
+I={input.namedsorted_bam} \
+O=/dev/stdout \
+RECALCULATE_SA_SUPPLEMENTARY=true \
+SOFTEN_HARD_CLIPS=true \
+FIX_MATE_INFORMATION=true \
+FIX_DUPLICATE_FLAG=true \
+FIX_SA=true \
+FIX_MISSING_HARD_CLIP=true \
+TAGS=null \
+TAGS=NM \
+TAGS=SA \
+TAGS=R2 \
+TAGS=Q2 \
+TAGS=MC \
+TAGS=MQ \
+ASSUME_SORTED=true \
+{params.picardoptions} \
+| samtools sort \
+-m 100G \
+-T {params.tmp_sort} \
+-Obam \
+-o {output.coordinate_bam} \
+-@ {threads} \
+/dev/stdin
+        """
+
+
+rule SoftClipsToSplitReads:
+    threads:
+        100
+    input:
+        ref=reference,
+        coordinate_bam="tmp/gridss/{sample}.bam.gridss.working/{sample}.coordinate.bam"
+    output:
+        primary_sv="tmp/gridss/{sample}.bam.gridss.working/{sample}.sc2sr.primary.sv.bam",
+        supp_sv="tmp/gridss/{sample}.bam.gridss.working/{sample}.sc2sr.supp.sv.bam",
+    params:
+        working_dir="tmp/gridss",
+        picardoptions="",
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.SoftClipsToSplitReads \
+{jvm_args} \
+-Xmx20G \
+-Dsamjdk.create_index=false \
+-Dgridss.gridss.output_to_temp_file=true \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+I={input.coordinate_bam} \
+O={output.primary_sv} \
+OUTPUT_UNORDERED_RECORDS={output.supp_sv} \
+WORKER_THREADS={threads} \
+{params.picardoptions}
+        """
+
+
+rule SortSv:
+    threads:
+        64
+    input:
+        supp_sv="{x}.sc2sr.supp.sv.bam"
+    output:
+        supp_sv="{x}.sc2sr.suppsorted.sv.bam"
+    params:
+        tmp_sort="{x}.suppsorted.sv-tmp",
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        "samtools sort -m 100G -@ {threads} -T {params.tmp_sort} -Obam -o {output.supp_sv} {input.supp_sv}"
+
+
+rule MergeSupported:
+    threads:
+        64
+    input:
+        primary_sv="{x}.sc2sr.primary.sv.bam",
+        supp_sv="{x}.sc2sr.suppsorted.sv.bam",
+    output:
+        merged="{x}.bam.sv.bam"
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        "samtools merge -@ {threads} {output.merged} {input.primary_sv} {input.supp_sv}"
+
+
+rule BamIndex:
+    threads:
+        4
+    input:
+        "{x}.bam"
+    output:
+        "{x}.bam.bai"
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        "sambamba index -t {threads} {input}"
+
+rule AssembleBreakends:
+    threads:
+        64
+    input:
+        ref=reference,
+        bams=lambda wc: expand("../varlociraptor/results/dedup/{sample}.{ending}", sample=get_group_samples(wc), ending=["bam", "bam.bai"]),
+        svs=lambda wc: expand("tmp/gridss/{sample}.bam.gridss.working/{sample}.bam.sv.{ending}", sample=get_group_samples(wc), ending=["bam", "bam.bai"])
+    output:
+        assembly="results/gridss_assembly/group.{group}.bam"
+    conda:
+        "envs/gridss.yaml"
+    params:
+        jobindex="0",
+        jobnodes="1",
+        working_dir="tmp/gridss",
+        picardoptions="",
+        input_args=lambda wc: " ".join(expand("INPUT=../varlociraptor/results/dedup/{sample}.bam", sample=get_group_samples(wc)))
+    shell:
+        """
+gridss gridss.AssembleBreakends \
+-Dgridss.gridss.output_to_temp_file=true \
+{jvm_args} \
+-Xmx100g \
+JOB_INDEX={params.jobindex} \
+JOB_NODES={params.jobnodes} \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+WORKER_THREADS={threads} \
+O={output.assembly} \
+{params.input_args} \
+{params.picardoptions} \
+        """
+
+
+rule CollectGridssMetrics2:
+    input:
+        assembly="results/gridss_assembly/group.{group}.bam"
+    output:
+        "test.test"
+    params:
+        prefix="results/gridss_assemble_metrics/group.{group}",
+    shell:
+        """
+gridss gridss.analysis.CollectGridssMetrics \
+{jvm_args} \
+I={input.assembly} \
+O={params.prefix} \
+THRESHOLD_COVERAGE=$maxcoverage \
+TMP_DIR=$workingdir \
+FILE_EXTENSION=null \
+GRIDSS_PROGRAM=null \
+GRIDSS_PROGRAM=CollectCigarMetrics \
+GRIDSS_PROGRAM=CollectMapqMetrics \
+GRIDSS_PROGRAM=CollectTagMetrics \
+GRIDSS_PROGRAM=CollectIdsvMetrics \
+GRIDSS_PROGRAM=ReportThresholdCoverage \
+PROGRAM=null \
+PROGRAM=CollectAlignmentSummaryMetrics \
+{params.picardoptions}
+        """
+
+
+rule SoftClipsToSplitReadsAssembly:
+    threads:
+        64
+    input:
+        ref=reference,
+        assembly="results/gridss_assembly/group.{group}.bam"
+    output:
+        assembly_primary_sv="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.sc2sr.primary.sv.bam",
+        assembly_supp_sv="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.sc2sr.supp.sv.bam",
+    params:
+        working_dir="tmp/gridss",
+        picardoptions="",
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.SoftClipsToSplitReads \
+{jvm_args} \
+-Xmx50G \
+-Dgridss.async.buffersize=16 \
+-Dsamjdk.create_index=false \
+-Dgridss.gridss.output_to_temp_file=true \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+WORKER_THREADS={threads} \
+I={input.assembly} \
+O={output.assembly_primary_sv} \
+OUTPUT_UNORDERED_RECORDS={output.assembly_supp_sv} \
+REALIGN_ENTIRE_READ=true \
+{params.picardoptions}
+        """
+
+
+rule IdentifyVariants:
+    threads:
+        64
+    input:
+        assembly_sv="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.bam.sv.bam",
+        assembly_sv_index="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.bam.sv.bam.bai",
+        assembly="results/gridss_assembly/group.{group}.bam",
+        ref=reference,
+    output:
+        unallocated="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.unallocated.vcf"
+    conda:
+        "envs/gridss.yaml"
+    params:
+        input_args=" ".join(expand("INPUT=../varlociraptor/results/dedup/{sample}.bam", sample=["EPF-BUR-012-013"])),
+        working_dir="tmp/gridss",
+        picardoptions=""
+    shell:
+        """
+gridss gridss.IdentifyVariants \
+-Dgridss.output_to_temp_file=true \
+{jvm_args} \
+-Xmx50g \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+WORKER_THREADS={threads} \
+{params.input_args} \
+ASSEMBLY={input.assembly} \
+OUTPUT_VCF={output.unallocated} \
+        """
+
+rule AnnotateVariants:
+    threads:
+        7
+    input:
+        assembly_sv="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.bam.sv.bam",
+        assembly_sv_index="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.bam.sv.bam.bai",
+        unallocated="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.unallocated.vcf",
+        ref=reference,
+        assembly="results/gridss_assembly/group.{group}.bam",
+    output:
+        allocated="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.allocated.vcf",
+    params:
+        input_args=" ".join(expand("INPUT=../varlociraptor/results/dedup/{sample}.bam", sample=["EPF-BUR-012-013"])),
+        working_dir="tmp/gridss",
+        picardoptions=""
+    conda:
+        "envs/gridss.yaml"
+    shell:        """
+gridss gridss.AnnotateVariants \
+-Dgridss.output_to_temp_file=true \
+{jvm_args} \
+-Xmx50g \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+WORKER_THREADS={threads} \
+{params.input_args} \
+ASSEMBLY={input.assembly} \
+INPUT_VCF={input.unallocated} \
+OUTPUT_VCF={output.allocated} \
+{params.picardoptions}
+        """
+
+rule AnnotateUntemplatedSequence:
+    threads:
+        64
+    input:
+        allocated="tmp/gridss/group.{group}.bam.gridss.working/group.{group}.allocated.vcf",
+        ref=reference,
+    output:
+        vcf="results/gridss_vcf/{group}.vcf"
+    params:
+        working_dir="tmp/gridss",
+        picardoptions=""
+    conda:
+        "envs/gridss.yaml"
+    shell:
+        """
+gridss gridss.AnnotateUntemplatedSequence \
+-Dgridss.output_to_temp_file=true \
+-Xmx4g \
+{jvm_args} \
+TMP_DIR={params.working_dir} \
+WORKING_DIR={params.working_dir} \
+REFERENCE_SEQUENCE={input.ref} \
+WORKER_THREADS={threads} \
+INPUT={input.allocated} \
+OUTPUT={output.vcf} \
+{params.picardoptions}
+        """

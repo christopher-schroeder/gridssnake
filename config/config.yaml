@@ -1,0 +1,8 @@
+reference: "ref/GCA_000001405.15_GRCh38_no_alt_plus_hs38d1_analysis_set.fna"
+units: "../config/units_epilepsie.tsv"
+#  - "config/units_eppendorf.tsv"
+samples: "../config/samples_epilepsie.tsv"
+#  - "config/samples_eppendorf.tsv"
+
+params:
+  cutadapt: "-m 25"
